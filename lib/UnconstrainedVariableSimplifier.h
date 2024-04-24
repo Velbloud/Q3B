@@ -151,9 +151,7 @@ public:
         forcedGoal = goal;
     }
 
-    void ReconstructModel(Model &model) override {
-	std::cout << "Warning: model reconstruction for unconstrained simplifications is not implemented \n";
-    }
+    void ReconstructModel(Model &model) override ;
 
 private:
     z3::context* context;
@@ -191,6 +189,11 @@ private:
 
     std::set<std::string> forcedConstrained;
     std::optional<Goal> forcedGoal;
+
+    std::vector<std::tuple<z3::expr, z3::expr, bool>> appliedSubstitutions;
+    bool isFreeVariable(z3::expr e);
+    void ReconstructModelForMul(Model &model);
+
 };
 
 #endif // UNCONSTRAINEDVARIABLESIMPLIFIER_H

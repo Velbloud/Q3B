@@ -68,6 +68,8 @@ Result Solver::getResult(z3::expr expr, Approximation approximation, int effecti
 
 Result Solver::Solve(z3::expr expr, Approximation approximation, int effectiveBitWidth)
 {
+    auto pes = expr;
+
     if (!config.validatingSolver)
     {
         Solver::resultComputed = false;
@@ -114,10 +116,17 @@ Result Solver::Solve(z3::expr expr, Approximation approximation, int effectiveBi
 	else if (result == UNSAT) result = SAT;
     }
 
-    if (config.produceModels)
+    if (config.produceModels && result == SAT)
     {
 	simplifier.ReconstructModel(model);
+
+    if (substituteModel(pes,model).is_false())
+        std::cout << "ŠPATNE VŠECHNO ŠPATNĚ" << std::endl;
+
+
     }
+
+    //printModel(model);
 
     return result;
 }
@@ -232,7 +241,7 @@ Result Solver::SolveParallel(z3::expr expr)
     over.join();
     under.join();
 
-    if (config.produceModels)
+    if (config.produceModels && globalResult == SAT)
     {
 	simplifier.ReconstructModel(model);
     }
