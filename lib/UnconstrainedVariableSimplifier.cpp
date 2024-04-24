@@ -5,9 +5,13 @@
 #include "ExprSimplifier.h"
 #include <algorithm>
 #include <sstream>
+#include <boost/integer/mod_inverse.hpp>
+#include <gmp.h>
 
 using namespace std;
 using namespace z3;
+using boost::integer::mod_inverse;
+
 
 map<string, int> UnconstrainedVariableSimplifier::countVariableOccurences(expr e, bool isPositive, Goal goal = NONE)
 {
@@ -259,36 +263,60 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
 	unsigned num = e.num_args();
 	auto decl_kind = f.decl_kind();
 
-        if (decl_kind == Z3_OP_BADD || decl_kind == Z3_OP_BXOR)
+    if (decl_kind == Z3_OP_BADD || decl_kind == Z3_OP_BXOR)
 	{
-            for (unsigned int i = 0; i < num; i++)
+        for (unsigned int i = 0; i < num; i++)
+        {
+            if (!isUnconstrained(e.arg(i), boundVars))
             {
-                if (!isUnconstrained(e.arg(i), boundVars))
-                {
-                    continue;
-                }
+                continue;
+            }
 
-                bool allBefore = true;
-                for (unsigned int j = 0; j < num; j++)
+            bool allBefore = true;
+            for (unsigned int j = 0; j < num; j++)
+            {
+                if (i != j && !isBefore(e.arg(j), e.arg(i), boundVars, isPositive))
                 {
-                    if (i != j && !isBefore(e.arg(j), e.arg(i), boundVars, isPositive))
-                    {
-                        allBefore = false;
-                        break;
-                    }
-                }
-
-                if (allBefore)
-                {
-                    return e.arg(i);
+                    allBefore = false;
+                    break;
                 }
             }
+
+            if (allBefore)
+            {
+                long int bvSize = e.arg(0).get_sort().bv_size();
+                expr e_without_unconstr_vars = context->bv_val(0, bvSize);
+                if (decl_kind == Z3_OP_BADD) {
+                    if (isFreeVariable(e.arg(i))) {
+                        for (auto j = 0; j < num; j++) {
+                            if (i != j) {
+                                e_without_unconstr_vars = to_expr(*context, Z3_mk_bvadd(*context, (Z3_ast) e_without_unconstr_vars, (Z3_ast)e.arg(j)));
+                            }
+                        }
+                        appliedSubstitutions.push_back({e.arg(i), to_expr(*context, e.arg(i) - e_without_unconstr_vars), false});
+                    }
+                }
+                else {
+                    if (isFreeVariable(e.arg(i))) {
+                        for (int j = 0; j < num; j++) {
+                            if (i != j) {
+                                e_without_unconstr_vars = to_expr(*context, Z3_mk_bvxor(*context, (Z3_ast) e_without_unconstr_vars, (Z3_ast)e.arg(j)));
+                            }
+                        }
+                        appliedSubstitutions.push_back({e.arg(i), to_expr(*context, e.arg(i) - e_without_unconstr_vars), false});
+                    }
+                }
+                return e.arg(i);
+            }
+        }
 	}
 	else if (decl_kind == Z3_OP_BNOT)
 	{
 	    if (isUnconstrained(e.arg(0), boundVars))
 	    {
-		return e.arg(0);
+            if(isFreeVariable(e.arg(0)))
+                appliedSubstitutions.push_back({e.arg(0), e, false});
+            return e.arg(0);
 	    }
 	}
 	else if (decl_kind == Z3_OP_BAND || decl_kind == Z3_OP_BOR)
@@ -299,40 +327,111 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
 	    if (unconstrained0 && unconstrained1 &&
                 getBoundType(e.arg(0), boundVars) == getBoundType(e.arg(1), boundVars))
 	    {
+
+        int bvSize = e.arg(1).get_sort().bv_size();
+        expr zero = context->bv_val(0, bvSize);
+        expr ones = context->bv_val(-1, bvSize);
+
 		if (isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
 		{
-		    return e.arg(1);
+            if (decl_kind == Z3_OP_BAND) {
+                if(isFreeVariable(e.arg(0)))
+                    appliedSubstitutions.push_back({e.arg(0), ones, false});
+            }
+            if (decl_kind == Z3_OP_BOR) {
+                if(isFreeVariable(e.arg(0)))
+                    appliedSubstitutions.push_back({e.arg(0), zero, false});
+            }
+            return e.arg(1);
 		}
 		else
 		{
+            if (decl_kind == Z3_OP_BAND) {
+                if(isFreeVariable(e.arg(1)))
+                    appliedSubstitutions.push_back({e.arg(1), ones, false});
+            }
+            if (decl_kind == Z3_OP_OR) {
+                if(isFreeVariable(e.arg(1)))
+                    appliedSubstitutions.push_back({e.arg(1), zero, false});
+            }
 		    return e.arg(0);
 		}
 	    }
 	}
-	else if (decl_kind == Z3_OP_BMUL && num == 2)
+    else if (decl_kind == Z3_OP_BMUL && num == 2)
 	{
 	    bool unconstrained0 = isUnconstrained(e.arg(0), boundVars);
 	    bool unconstrained1 = isUnconstrained(e.arg(1), boundVars);
 
-	    if (unconstrained0 && unconstrained1 &&
+        int bvSize = e.arg(0).get_sort().bv_size();
+        expr one = context->bv_val(1, bvSize);
+        expr ones = context->bv_val(-1, bvSize);
+        expr zero = context->bv_val(0, bvSize);
+        auto maxSigned = concat(context->bv_val(0, 1), context->bv_val(-1, bvSize - 1)); //011...1
+
+
+        if (unconstrained0 && unconstrained1 &&
                 getBoundType(e.arg(0), boundVars) == getBoundType(e.arg(1), boundVars))
 	    {
 		if (isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
 		{
+            if (isFreeVariable(e.arg(1)))
+                appliedSubstitutions.push_back({e.arg(0), one, false});
 		    return e.arg(1);
 		}
 		else
 		{
+            if (isFreeVariable(e.arg(0)))
+                appliedSubstitutions.push_back({e.arg(1), one, false});
 		    return e.arg(0);
 		}
 	    }
 	    else if (unconstrained0 && isBefore(e.arg(1), e.arg(0), boundVars, isPositive))
 	    {
-                return e.arg(0) & (e.arg(1) | -e.arg(1));
+            if (goalUnconstrained) {
+                bool flip = (!isPositive && getBoundType(e.arg(0), boundVars) == EXISTENTIAL) ||
+                            (isPositive && getBoundType(e.arg(0), boundVars) == UNIVERSAL);
+
+                if ((!flip && goal == SIGN_MAX) || (flip && goal == SIGN_MIN)) {
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), maxSigned, false});
+                        appliedSubstitutions.push_back({e.arg(0), e.arg(1), true});
+                    }
+                    return maxSigned & (e.arg(1) | -e.arg(1));
+                } else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN)) {
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), ones, false});
+                        appliedSubstitutions.push_back({e.arg(0), e.arg(1), true});
+                    }
+                    return (e.arg(1) | -e.arg(1));
+                } else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX)) {
+                    auto minSigned = z3::concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)); //1000...0
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), minSigned, false});
+                        appliedSubstitutions.push_back({e.arg(0), e, true});
+                    }
+                    return z3::ite(e.arg(1) == zero, zero,minSigned);
+                } else if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX)) {
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), zero, false});
+                    }
+                    return zero;
+                }
+            }
+
+            if (isFreeVariable(e.arg(0))) {
+                appliedSubstitutions.push_back({e.arg(0), e, true});
+            }
+            return e.arg(0) & (e.arg(1) | -e.arg(1));
 	    }
+
+
 	    else if (unconstrained1 && isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
 	    {
-                return e.arg(1) & (e.arg(0) | -e.arg(0));
+            if (isFreeVariable(e.arg(1))) {
+                appliedSubstitutions.push_back({e.arg(1), e.arg(0), true});
+            }
+            return e.arg(1) & (e.arg(0) | -e.arg(0));
 	    }
 	}
 	else if (decl_kind == Z3_OP_BSHL)
@@ -340,26 +439,35 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
 	    bool unconstrained0 = isUnconstrained(e.arg(0), boundVars);
 	    bool unconstrained1 = isUnconstrained(e.arg(1), boundVars);
 
+        int bvSize = e.arg(1).get_sort().bv_size();
+        expr zero = context->bv_val(0, bvSize);
+        expr one = context->bv_val(1, bvSize);
+        expr zeroes = context->bv_val(0, bvSize);
+        expr ones = context->bv_val(-1, bvSize);
+
 	    if (unconstrained0 && unconstrained1 &&
                 getBoundType(e.arg(0), boundVars) == getBoundType(e.arg(1), boundVars))
 	    {
 		if (isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
 		{
+            if (isFreeVariable(e.arg(0)) && isFreeVariable(e.arg(1))) {
+                appliedSubstitutions.push_back({e.arg(1), zero, false});
+                appliedSubstitutions.push_back({e.arg(0), e.arg(1), false});
+            }
 		    return e.arg(1);
 		}
 		else
 		{
+            if (isFreeVariable(e.arg(1)))
+                appliedSubstitutions.push_back({e.arg(1), zero, false});
 		    return e.arg(0);
 		}
 	    }
 	    else if (unconstrained0 && isBefore(e.arg(1), e.arg(0), boundVars, isPositive))
 	    {
-                expr arg1 = e.arg(1);
-		int bvSize = e.arg(1).get_sort().bv_size();
-		expr ones = context->bv_val(-1, bvSize);
-                expr zeroes = context->bv_val(0, bvSize);
+            expr arg1 = e.arg(1);
 
-                if (goalUnconstrained)
+            if (goalUnconstrained)
                 {
                     bool flip = (!isPositive && getBoundType(e.arg(0), boundVars) == EXISTENTIAL) ||
                         (isPositive && getBoundType(e.arg(0), boundVars) == UNIVERSAL);
@@ -367,47 +475,64 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
                     if ((!flip && goal == SIGN_MAX) || (flip && goal == SIGN_MIN))
                     {
                         auto maxSigned = concat(context->bv_val(0, 1), context->bv_val(-1, bvSize - 1)); //011...1
+                        if (isFreeVariable(e.arg(0))) {
+                            appliedSubstitutions.push_back({e.arg(0), z3::ashr(maxSigned, arg1), false});
+                        }
                         return z3::shl(z3::ashr(maxSigned, arg1), arg1);
                     }
                     else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
                     {
+                        if (isFreeVariable(e.arg(0))) {
+                            appliedSubstitutions.push_back({e.arg(0), ones, false});
+                        }
                         return z3::shl(ones, e.arg(1));
                     }
                     else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
                     {
                         auto minSigned = z3::concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)); //1000...0
+                        if (isFreeVariable(e.arg(0))) {
+                            appliedSubstitutions.push_back({e.arg(0), z3::ashr(minSigned, arg1), false});
+                        }
                         return z3::ite(z3::ult(arg1, bvSize), minSigned, zeroes);
                     }
                     else if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
                     {
+                        if (isFreeVariable(e.arg(0))) {
+                            appliedSubstitutions.push_back({e.arg(0), zero, false});
+                        }
                         return zeroes;
                     }
                 }
 
-		auto shiftExpr = to_expr(*context, Z3_mk_bvshl(*context, (Z3_ast)ones, (Z3_ast)arg1));
+		    auto shiftExpr = to_expr(*context, Z3_mk_bvshl(*context, (Z3_ast)ones, (Z3_ast)arg1));
 
-		return (e.arg(0) & shiftExpr);
+            if (isFreeVariable(e.arg(0))) {
+                expr subst = to_expr(*context, Z3_mk_bvlshr(*context, (Z3_ast)e.arg(0), (Z3_ast)e.arg(1)));
+                appliedSubstitutions.push_back({e.arg(0), subst, false});
+            }
+            return (e.arg(0) & shiftExpr);
 	    }
 	    else if (unconstrained1 && isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
 	    {
-                if (goalUnconstrained)
-                {
-                    int bvSize = e.arg(1).get_sort().bv_size();
-                    expr zeroes = context->bv_val(0, bvSize);
-
-                    bool flip = (!isPositive && getBoundType(e.arg(1), boundVars) == EXISTENTIAL) ||
+            if (goalUnconstrained)
+            {
+                bool flip = (!isPositive && getBoundType(e.arg(1), boundVars) == EXISTENTIAL) ||
                         (isPositive && getBoundType(e.arg(1), boundVars) == UNIVERSAL);
 
-                    if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
-                    {
-                        return zeroes;
+                if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
+                {
+                    if (isFreeVariable(e.arg(1))) {
+                        appliedSubstitutions.push_back({e.arg(1), ones, false}); // nerozumim nevyhodnosti
                     }
-                    else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
-                    {
-                        auto minSigned = z3::concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)); //1000...0
-                        return z3::ite(e.arg(0) == 0, zeroes, minSigned);
-                    }
+                    return zeroes;
                 }
+                else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
+                {
+                    auto minSigned = z3::concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)); //1000...0
+                    //je to problematičtější, je potřeba najít kde je v arg1 jednička
+                    return z3::ite(e.arg(0) == 0, zeroes, minSigned);
+                }
+            }
 	    }
 	}
 	else if (decl_kind == Z3_OP_BLSHR)
@@ -415,82 +540,117 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
 	    bool unconstrained0 = isUnconstrained(e.arg(0), boundVars);
 	    bool unconstrained1 = isUnconstrained(e.arg(1), boundVars);
 
+        int bvSize = e.arg(1).get_sort().bv_size();
+        expr zero = context->bv_val(0, bvSize);
+        expr one = context->bv_val(1, bvSize);
+        expr ones = context->bv_val(-1, bvSize);
+        expr zeroes = context->bv_val(0, bvSize);
+
 	    if (unconstrained0 && unconstrained1 &&
-                getBoundType(e.arg(0), boundVars) == getBoundType(e.arg(1), boundVars))
+            getBoundType(e.arg(0), boundVars) == getBoundType(e.arg(1), boundVars))
 	    {
-		if (isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
-		{
-		    return e.arg(1);
-		}
-		else
-		{
-		    return e.arg(0);
-		}
+		    if (isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
+		    {
+                if(isFreeVariable(e.arg(0)) && isFreeVariable(e.arg(1))) {
+                    appliedSubstitutions.push_back({e.arg(1), zero, false});
+                    appliedSubstitutions.push_back({e.arg(0), e.arg(1), false});
+                }
+                return e.arg(1);
+		    }
+		    else
+		    {
+                if(isFreeVariable(e.arg(0)) && isFreeVariable(e.arg(1)))
+                    appliedSubstitutions.push_back({e.arg(1), zero, false});
+		        return e.arg(0);
+		    }
 	    }
 	    else if (unconstrained0 && isBefore(e.arg(1), e.arg(0), boundVars, isPositive))
 	    {
-                int bvSize = e.arg(1).get_sort().bv_size();
-		expr arg1 = e.arg(1);
-		expr ones = context->bv_val(-1, bvSize);
-                expr zeroes = context->bv_val(0, bvSize);
+		    expr arg1 = e.arg(1);
 
-                if (goalUnconstrained)
-                {
-                    bool flip = (!isPositive && getBoundType(e.arg(0), boundVars) == EXISTENTIAL) ||
+            if (goalUnconstrained)
+            {
+                bool flip = (!isPositive && getBoundType(e.arg(0), boundVars) == EXISTENTIAL) ||
                         (isPositive && getBoundType(e.arg(0), boundVars) == UNIVERSAL);
 
-                    if ((!flip && goal == SIGN_MAX) || (flip && goal == SIGN_MIN))
-                    {
-                        auto maxSigned = concat(context->bv_val(0, 1), context->bv_val(-1, bvSize - 1));
-                        return z3::ite(arg1 == 0, maxSigned, to_expr(*context, Z3_mk_bvlshr(*context, ones, arg1)));
-                    }
-                    else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
-                    {
-                        return to_expr(*context, Z3_mk_bvlshr(*context, ones, arg1));
-                    }
-                    else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
-                    {
-                        auto minSigned = z3::concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)); //1000...0
-                        return z3::ite(arg1 == 0, minSigned, zeroes);
-                    }
-                    else if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
-                    {
-                        return zeroes;
-                    }
-                }
-
-		auto shiftExpr = to_expr(*context, Z3_mk_bvlshr(*context, (Z3_ast)ones, (Z3_ast)arg1));
-                return (e.arg(0) & shiftExpr);
-	    }
-            else if (unconstrained1 && isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
-	    {
-                int bvSize = e.arg(0).get_sort().bv_size();
-		expr arg0 = e.arg(0);
-		expr ones = context->bv_val(-1, bvSize);
-                expr zeroes = context->bv_val(0, bvSize);
-
-                if (goalUnconstrained)
+                if ((!flip && goal == SIGN_MAX) || (flip && goal == SIGN_MIN))
                 {
-                    bool flip = (!isPositive && getBoundType(e.arg(1), boundVars) == EXISTENTIAL) ||
-                        (isPositive && getBoundType(e.arg(1), boundVars) == UNIVERSAL);
-
-                    if ((!flip && goal == SIGN_MAX) || (flip && goal == SIGN_MIN))
-                    {
-                        return z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, arg0, f(arg0, 1));
+                    auto maxSigned = concat(context->bv_val(0, 1), context->bv_val(-1, bvSize - 1));
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), z3::ite(arg1 == 0, maxSigned, ones), false});
                     }
-                    else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
-                    {
-                        return arg0;
-                    }
-                    else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
-                    {
-                        return z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, zeroes, arg0);
-                    }
-                    else if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
-                    {
-                        return zeroes;
-                    }
+                    return z3::ite(arg1 == 0, maxSigned, to_expr(*context, Z3_mk_bvlshr(*context, ones, arg1)));
                 }
+                else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
+                {
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), ones, false});
+                    }
+                    return to_expr(*context, Z3_mk_bvlshr(*context, ones, arg1));
+                }
+                else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
+                {
+                    auto minSigned = z3::concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)); //1000...0
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), ones, false});
+                    }
+                    return z3::ite(arg1 == 0, minSigned, zeroes);
+                }
+                else if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
+                {
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), zero, false});
+                    }
+                    return zeroes;
+                }
+            }
+
+		    auto shiftExpr = to_expr(*context, Z3_mk_bvlshr(*context, (Z3_ast)ones, (Z3_ast)arg1));
+
+            if(isFreeVariable(e.arg(0))) {
+                expr subst = to_expr(*context, Z3_mk_bvlshr(*context, (Z3_ast)e.arg(0), (Z3_ast)arg1));
+                appliedSubstitutions.push_back({e.arg(0), subst, false});
+            }
+            return (e.arg(0) & shiftExpr);
+	    }
+        else if (unconstrained1 && isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
+	    {
+		    expr arg0 = e.arg(0);
+
+            if (goalUnconstrained)
+            {
+                bool flip = (!isPositive && getBoundType(e.arg(1), boundVars) == EXISTENTIAL) ||
+                    (isPositive && getBoundType(e.arg(1), boundVars) == UNIVERSAL);
+
+                if ((!flip && goal == SIGN_MAX) || (flip && goal == SIGN_MIN))
+                {
+                    if (isFreeVariable(e.arg(1))) {
+                        appliedSubstitutions.push_back({e.arg(1), z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, zero, one), false});
+                    }
+                    return z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, arg0, f(arg0, 1));
+                }
+                else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
+                {
+                    if (isFreeVariable(e.arg(1))) {
+                        appliedSubstitutions.push_back({e.arg(1), zero, false});
+                    }
+                    return arg0;
+                }
+                else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
+                {
+                    if (isFreeVariable(e.arg(1))) {
+                        appliedSubstitutions.push_back({e.arg(1), z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, ones, zero), false});
+                    }
+                    return z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, zeroes, arg0);
+                }
+                else if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
+                {
+                    if (isFreeVariable(e.arg(1))) {
+                        appliedSubstitutions.push_back({e.arg(1), ones, false});
+                    }
+                    return zeroes;
+                }
+            }
 	    }
 	}
 	else if (decl_kind == Z3_OP_BASHR)
@@ -498,90 +658,129 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
 	    bool unconstrained0 = isUnconstrained(e.arg(0), boundVars);
 	    bool unconstrained1 = isUnconstrained(e.arg(1), boundVars);
 
+        int bvSize = e.arg(1).get_sort().bv_size();
+        expr zero = context->bv_val(0, bvSize);
+        expr one = context->bv_val(1, bvSize);
+
 	    if (unconstrained0 && unconstrained1 &&
                 getBoundType(e.arg(0), boundVars) == getBoundType(e.arg(1), boundVars))
 	    {
-		if (isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
-		{
-		    return e.arg(1);
-		}
-		else
-		{
-		    return e.arg(0);
-		}
+            if (isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
+            {
+                if(isFreeVariable(e.arg(0)) && isFreeVariable(e.arg(1))) {
+                    appliedSubstitutions.push_back({e.arg(1), zero, false});
+                    appliedSubstitutions.push_back({e.arg(0), e.arg(1), false});
+                }
+                return e.arg(1);
+            }
+            else
+            {
+                if(isFreeVariable(e.arg(0)) && isFreeVariable(e.arg(1)))
+                    appliedSubstitutions.push_back({e.arg(1), zero, false});
+                return e.arg(0);
+            }
 	    }
 	    else if (unconstrained0 && isBefore(e.arg(1), e.arg(0), boundVars, isPositive))
 	    {
-                int bvSize = e.arg(1).get_sort().bv_size();
-		expr arg1 = e.arg(1);
-		expr ones = context->bv_val(-1, bvSize);
-                expr zeroes = context->bv_val(0, bvSize);
-                auto minSigned = z3::concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)); //1000...0
+            int bvSize = e.arg(1).get_sort().bv_size();
+		    expr arg1 = e.arg(1);
+            expr ones = context->bv_val(-1, bvSize);
+            expr zeroes = context->bv_val(0, bvSize);
+            auto minSigned = z3::concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)); //1000...0
+            if (goalUnconstrained)
+            {
+                bool flip = (!isPositive && getBoundType(e.arg(0), boundVars) == EXISTENTIAL) || (isPositive && getBoundType(e.arg(0), boundVars) == UNIVERSAL);
 
-                if (goalUnconstrained)
+                if ((!flip && goal == SIGN_MAX) || (flip && goal == SIGN_MIN))
                 {
-                    bool flip = (!isPositive && getBoundType(e.arg(0), boundVars) == EXISTENTIAL) ||
-                        (isPositive && getBoundType(e.arg(0), boundVars) == UNIVERSAL);
-
-                    if ((!flip && goal == SIGN_MAX) || (flip && goal == SIGN_MIN))
-                    {
-                        auto maxSigned = concat(context->bv_val(0, 1), context->bv_val(-1, bvSize - 1));
-                        return to_expr(*context, Z3_mk_bvashr(*context, maxSigned, arg1));
+                    auto maxSigned = concat(context->bv_val(0, 1), context->bv_val(-1, bvSize - 1));
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), maxSigned, false});
                     }
-                    else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
-                    {
-                        return ones;
-                    }
-                    else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
-                    {
-                        return f(minSigned, arg1);
-                    }
-                    else if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
-                    {
-                        return context->bv_val(0, bvSize);
-                    }
+                    // proc tady neni f(minSigned, arg1)?
+                    return to_expr(*context, Z3_mk_bvashr(*context, maxSigned, arg1));
                 }
+                else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
+                {
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), ones, false});
+                    }
+                    return ones;
+                }
+                else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
+                {
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), minSigned, false});
+                    }
+                    return f(minSigned, arg1);
+                }
+                else if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
+                {
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), zero, false});
+                    }
+                    return zero;
+                }
+            }
 
-                // can return precisely numbers with the same t+1 most-significant bits
+            // can return precisely numbers with the same t+1 most-significant bits
 
-                // (bvashr u t) -> (ite (or (= (bvand u (bvashr minSigned t)) 0)
-                //                          (= (bvand u (bvashr minSigned t)) (bvashr minSigned t)))
-                //                      u
-                //                      0)
-                auto onlyTopFromU = e.arg(0) & f(minSigned, e.arg(1));
-                return z3::ite(onlyTopFromU == 0 || onlyTopFromU == f(minSigned, e.arg(1)),
+            // (bvashr u t) -> (ite (or (= (bvand u (bvashr minSigned t)) 0)
+            //                          (= (bvand u (bvashr minSigned t)) (bvashr minSigned t)))
+            //                      u
+            //                      0)
+
+            auto onlyTopFromU = e.arg(0) & f(minSigned, e.arg(1));
+            expr shiftarg1 = to_expr(*context, Z3_mk_bvshl(*context, (Z3_ast)e.arg(0), (Z3_ast)e.arg(1)));
+            expr subst = z3::ite(onlyTopFromU == 0 || onlyTopFromU == f(minSigned, e.arg(1)),shiftarg1, zeroes);
+            if(isFreeVariable(e.arg(0))) {
+                appliedSubstitutions.push_back({e.arg(0), subst, false});
+            }
+            return z3::ite(onlyTopFromU == 0 || onlyTopFromU == f(minSigned, e.arg(1)),
                                       e.arg(0),
                                       zeroes);
 	    }
 	    else if (unconstrained1 && isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
 	    {
-                int bvSize = e.arg(0).get_sort().bv_size();
-		expr arg0 = e.arg(0);
-		expr ones = context->bv_val(-1, bvSize);
-                expr zeroes = context->bv_val(0, bvSize);
+            int bvSize = e.arg(0).get_sort().bv_size();
+	    	expr arg0 = e.arg(0);
+    		expr ones = context->bv_val(-1, bvSize);
+            expr zeroes = context->bv_val(0, bvSize);
 
-                if (goalUnconstrained)
+            if (goalUnconstrained)
+            {
+                bool flip = (!isPositive && getBoundType(e.arg(1), boundVars) == EXISTENTIAL) ||
+                    (isPositive && getBoundType(e.arg(1), boundVars) == UNIVERSAL);
+
+                if ((!flip && goal == SIGN_MAX) || (flip && goal == SIGN_MIN))
                 {
-                    bool flip = (!isPositive && getBoundType(e.arg(1), boundVars) == EXISTENTIAL) ||
-                        (isPositive && getBoundType(e.arg(1), boundVars) == UNIVERSAL);
-
-                    if ((!flip && goal == SIGN_MAX) || (flip && goal == SIGN_MIN))
-                    {
-                        return z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, arg0, ones);
+                    if (isFreeVariable(e.arg(1))) {
+                        appliedSubstitutions.push_back({e.arg(1), z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, zero, ones), false});
                     }
-                    else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
-                    {
-                        return z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, arg0, ones);
-                    }
-                    else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
-                    {
-                        return z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, zeroes, arg0);
-                    }
-                    else if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
-                    {
-                        return z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, zeroes, arg0);
-                    }
+                    return z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, arg0, ones);
                 }
+                else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
+                {
+                    if (isFreeVariable(e.arg(1))) {
+                        appliedSubstitutions.push_back({e.arg(1), z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, zero, ones), false});
+                    }
+                    return z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, arg0, ones);
+                }
+                else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
+                {
+                    if (isFreeVariable(e.arg(1))) {
+                        appliedSubstitutions.push_back({e.arg(1), z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, ones, zero), false});
+                    }
+                    return z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, zeroes, arg0);
+                }
+                else if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
+                {
+                    if (isFreeVariable(e.arg(1))) {
+                        appliedSubstitutions.push_back({e.arg(1), z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, ones, zero), false});
+                    }
+                    return z3::ite(arg0.extract(bvSize-1, bvSize-1) == 0, zeroes, arg0);
+                }
+            }
 	    }
 	}
 	else if (decl_kind == Z3_OP_BUREM_I)
@@ -589,68 +788,118 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
 	    bool unconstrained0 = isUnconstrained(e.arg(0), boundVars);
 	    bool unconstrained1 = isUnconstrained(e.arg(1), boundVars);
 
+        int bvSize = e.arg(1).get_sort().bv_size();
+        expr zero = context->bv_val(0, bvSize);
+        expr one = context->bv_val(1, bvSize);
+        expr ones = context->bv_val(-1, bvSize);
+
 	    if (unconstrained0 && unconstrained1 &&
                 getBoundType(e.arg(0), boundVars) == getBoundType(e.arg(1), boundVars))
 	    {
 		if (isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
 		{
+            if(isFreeVariable(e.arg(0)) && isFreeVariable(e.arg(1))) {
+                appliedSubstitutions.push_back({e.arg(1), zero, false});
+                appliedSubstitutions.push_back({e.arg(0), e.arg(1), false});
+            }
 		    return e.arg(1);
 		}
 		else
 		{
+            if(isFreeVariable(e.arg(0)) && isFreeVariable(e.arg(1)))
+                appliedSubstitutions.push_back({e.arg(1), zero, false});
 		    return e.arg(0);
 		}
 	    }
 	    else if (unconstrained0 && isBefore(e.arg(1), e.arg(0), boundVars, isPositive))
 	    {
-                //TODO: Goal unconstrained
+            if (goalUnconstrained)
+            {
+                bool flip = (!isPositive && getBoundType(e.arg(0), boundVars) == EXISTENTIAL) ||
+                            (isPositive && getBoundType(e.arg(0), boundVars) == UNIVERSAL);
 
-		int bvSize = e.arg(1).get_sort().bv_size();
-		expr zero = context->bv_val(0, bvSize);
-		auto bvult = to_expr(*context, Z3_mk_bvult(*context, (Z3_ast)e.arg(0), (Z3_ast)e.arg(1)));
-
-		// bvurem u t may return all values from {0,...,t-1}
-		// (bvurem u t) -> (ite (= t 0) u (ite (bvult u t) u 0))
-		return ite(e.arg(1) == zero,
-			   e.arg(0),
-			   ite(bvult, e.arg(0), zero));
-	    }
-            else if (unconstrained1 && isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
-	    {
-		int bvSize = e.arg(1).get_sort().bv_size();
-		expr zero = context->bv_val(0, bvSize);
-
-                if (goalUnconstrained)
+                if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
                 {
-                    bool flip = (!isPositive && getBoundType(e.arg(1), boundVars) == EXISTENTIAL) ||
-                        (isPositive && getBoundType(e.arg(1), boundVars) == UNIVERSAL);
-
-                    if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
-                    {
-                        return zero; //by setting divisor to max
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), e.arg(0), false});
                     }
-                    else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
-                    {
-                        return e.arg(0); //by setting divisor to zero
-                    }
-                    else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
-                    {
-                        //unsigned division can not change positive sign to negative sign
-                        //if positive, reduce to zero
-                        //if negative, leave the same, because remainder will not decrease the negative number
-                        return z3::ite(e.arg(0).extract(bvSize-1, bvSize-1) == 0, zero, e.arg(0));
-                    }
+                    return zero;
                 }
+                else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
+                {
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), e.arg(0) - 1, false});
+                    }
+                    return e.arg(0) - 1;
+                }
+                else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
+                {
+                    auto minSigned = z3::concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)); //1000...0
+                    if (isFreeVariable(e.arg(0))) {
+                        expr subst = z3::ite(e.arg(1).extract(bvSize-1, bvSize-1) == 0, e.arg(1), minSigned);
+                        appliedSubstitutions.push_back({e.arg(0), subst, false});
+                    }
+                    return z3::ite(e.arg(1).extract(bvSize-1, bvSize-1) == 0, zero, minSigned);
+                }
+            }
 
-                // bvurem t u may return all values from {0,...,(t-1)/2} \cup {t}
-		// (bvurem t u) -> (ite (= t 0) 0 ((ite (bvule u (bvudiv (- t 1) 2)) u t)))
-                auto bvule = to_expr(*context, Z3_mk_bvule(*context, e.arg(1),
-                                                           Z3_mk_bvudiv(*context,
-                                                                        (e.arg(0) - context->bv_val(1, bvSize)),
-                                                                        context->bv_val(2, bvSize))));
-                auto result = z3::ite(e.arg(0) == 0, zero,
+            auto bvult = to_expr(*context, Z3_mk_bvult(*context, (Z3_ast)e.arg(0), (Z3_ast)e.arg(1)));
+
+            // bvurem u t may return all values from {0,...,t-1}
+            // (bvurem u t) -> (ite (= t 0) u (ite (bvult u t) u 0))
+            if(isFreeVariable(e.arg(0)))
+                appliedSubstitutions.push_back({e.arg(0), ite(bvult, e.arg(0), zero), false});
+
+            return ite(e.arg(1) == zero,
+                   e.arg(0),
+                   ite(bvult, e.arg(0), zero));
+	    }
+        else if (unconstrained1 && isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
+	    {
+            if (goalUnconstrained)
+            {
+                bool flip = (!isPositive && getBoundType(e.arg(1), boundVars) == EXISTENTIAL) ||
+                    (isPositive && getBoundType(e.arg(1), boundVars) == UNIVERSAL);
+
+                if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
+                {
+                    if (isFreeVariable(e.arg(1))) {
+                        appliedSubstitutions.push_back({e.arg(1), one, false});
+                    } // nerozumim komentáři
+                    return zero; //by setting divisor to max
+                }
+                else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
+                {
+                    if (isFreeVariable(e.arg(1))) {
+                        appliedSubstitutions.push_back({e.arg(1), zero, false});
+                    }
+                    return e.arg(0); //by setting divisor to zero
+                }
+                else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
+                {
+                    if (isFreeVariable(e.arg(1))) {
+                        expr subst = z3::ite(e.arg(0).extract(bvSize-1, bvSize-1) == 0, one, ones);
+                        appliedSubstitutions.push_back({e.arg(1), subst, false});
+                    }
+                    //unsigned division can not change positive sign to negative sign
+                    //if positive, reduce to zero
+                    //if negative, leave the same, because remainder will not decrease the negative number
+                    return z3::ite(e.arg(0).extract(bvSize-1, bvSize-1) == 0, zero, e.arg(0));
+                }
+            }
+
+            // bvurem t u may return all values from {0,...,(t-1)/2} \cup {t}
+            // (bvurem t u) -> (ite (= t 0) 0 ((ite (bvule u (bvudiv (- t 1) 2)) u t)))
+            auto bvule = to_expr(*context, Z3_mk_bvule(*context, e.arg(1),
+                                                       Z3_mk_bvudiv(*context,
+                                                                    (e.arg(0) - context->bv_val(1, bvSize)),
+                                                                    context->bv_val(2, bvSize))));
+            if(isFreeVariable(e.arg(1)))
+                appliedSubstitutions.push_back({e.arg(1), z3::ite(bvule, e.arg(1) - e.arg(0), zero), false});
+
+            auto result = z3::ite(e.arg(0) == 0, zero,
                                       z3::ite(bvule, e.arg(1), e.arg(0)));
-                return result;
+            return result;
 	    }
 	}
 	else if (decl_kind == Z3_OP_BUDIV_I)
@@ -658,45 +907,68 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
 	    bool unconstrained0 = isUnconstrained(e.arg(0), boundVars);
 	    bool unconstrained1 = isUnconstrained(e.arg(1), boundVars);
 
+        int bvSize = e.arg(1).get_sort().bv_size();
+        expr zero = context->bv_val(0, bvSize);
+        expr one = context->bv_val(1, bvSize);
+        expr two = context->bv_val(2, bvSize);
+        expr ones = context->bv_val(-1, bvSize);
+        expr zeroes = context->bv_val(0, bvSize);
+
 	    if (unconstrained0 && unconstrained1 &&
                 getBoundType(e.arg(0), boundVars) == getBoundType(e.arg(1), boundVars))
 	    {
 		if (isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
 		{
+            if(isFreeVariable(e.arg(0)) && isFreeVariable(e.arg(1))) {
+                appliedSubstitutions.push_back({e.arg(1), one, false});
+                appliedSubstitutions.push_back({e.arg(0), e.arg(1), false});
+            }
 		    return e.arg(1);
 		}
 		else
 		{
+            if(isFreeVariable(e.arg(0)) && isFreeVariable(e.arg(1))) {
+                appliedSubstitutions.push_back({e.arg(1), one, false});
+            }
 		    return e.arg(0);
 		}
 	    }
 
-            if (unconstrained1 && isBefore(e.arg(0), e.arg(1), boundVars, isPositive) && goalUnconstrained)
+        if (unconstrained1 && isBefore(e.arg(0), e.arg(1), boundVars, isPositive) && goalUnconstrained)
             {
                 bool flip = (!isPositive && getBoundType(e.arg(1), boundVars) == EXISTENTIAL) ||
                     (isPositive && getBoundType(e.arg(1), boundVars) == UNIVERSAL);
 
-                int bvSize = e.arg(0).get_sort().bv_size();
-		expr arg0 = e.arg(0);
-		expr ones = context->bv_val(-1, bvSize);
-                expr zeroes = context->bv_val(0, bvSize);
+		        expr arg0 = e.arg(0);
 
                 if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
                 {
+                    if (isFreeVariable(e.arg(1)))
+                        appliedSubstitutions.push_back({e.arg(1), zero, false});
                     return ones;
                 }
                 else if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
                 {
+                    if (isFreeVariable(e.arg(1)))
+                        appliedSubstitutions.push_back({e.arg(1), ones, false});
                     return z3::ite(arg0 == ones, context->bv_val(1, bvSize), zeroes);
                 }
                 else if ((!flip && goal == SIGN_MAX) || (flip && goal == SIGN_MIN))
                 {
+                    if (isFreeVariable(e.arg(1))) {
+                        expr subst = z3::ite(e.arg(0).extract(bvSize - 1, bvSize - 1) == 0, one, two);
+                        appliedSubstitutions.push_back({e.arg(1), subst, false});
+                    }
                     //if positive, do not change, as unsigned division can not increase the number
                     //if negative, divide by 2 to get a positive number
                     return z3::ite(e.arg(0).extract(bvSize-1, bvSize-1) == 0, e.arg(0), f(arg0, 2));
                 }
                 else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
                 {
+                    if (isFreeVariable(e.arg(1))) {
+                        expr subst = z3::ite(e.arg(0).extract(bvSize - 1, bvSize - 1) == 0, zero,one);
+                        appliedSubstitutions.push_back({e.arg(1), subst, false});
+                    }
                     //if positive, reduce to -1
                     //if negative, do not change, as division would make it positive
                     return z3::ite(e.arg(0).extract(bvSize-1, bvSize-1) == 0, ones, arg0);
@@ -705,51 +977,69 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
 
 	    if (unconstrained0 && isBefore(e.arg(1), e.arg(0), boundVars, isPositive))
 	    {
-		int bvSize = e.arg(1).get_sort().bv_size();
-		expr ones = context->bv_val(-1, bvSize);
-		expr zero = context->bv_val(0, bvSize);
+		    auto bvudiv = to_expr(*context, Z3_mk_bvudiv(*context, (Z3_ast)ones, e.arg(1)));
+		    auto bvule = to_expr(*context, Z3_mk_bvule(*context, (Z3_ast)e.arg(0), bvudiv));
 
-		auto bvudiv = to_expr(*context, Z3_mk_bvudiv(*context, (Z3_ast)ones, e.arg(1)));
-		auto bvule = to_expr(*context, Z3_mk_bvule(*context, (Z3_ast)e.arg(0), bvudiv));
+            if (goalUnconstrained)
+            {
+                bool flip = (!isPositive && getBoundType(e.arg(0), boundVars) == EXISTENTIAL) ||
+                    (isPositive && getBoundType(e.arg(0), boundVars) == UNIVERSAL);
 
-                if (goalUnconstrained)
+                if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
                 {
-                    bool flip = (!isPositive && getBoundType(e.arg(0), boundVars) == EXISTENTIAL) ||
-                        (isPositive && getBoundType(e.arg(0), boundVars) == UNIVERSAL);
-
-                    if ((!flip && goal == UNSIGN_MIN) || (flip && goal == UNSIGN_MAX))
-                    {
-                        return z3::ite(e.arg(1) == zero, ones, zero);
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), zero, false});
                     }
-                    else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
-                    {
-                        return z3::ite(e.arg(1) == zero, ones, bvudiv); // for a/0, the max is 11..1, for a/b it is 11...1/b
-                    }
-                    else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
-                    {
-                        auto minSigned = z3::concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)); //1000...0
-                        return z3::ite(e.arg(1) == zero,
-                                       ones,
-                                       z3::ite(e.arg(1) == context->bv_val(1, bvSize),
-                                               minSigned,
-                                               zero));
-                    }
-                    else if ((!flip && goal == SIGN_MAX) || (flip && goal == SIGN_MIN))
-                    {
-                        auto maxSigned = concat(context->bv_val(0, 1), context->bv_val(-1, bvSize - 1));
-                        return z3::ite(e.arg(1) == zero,
-                                       ones,
-                                       z3::ite(e.arg(1) == context->bv_val(1, bvSize),
-                                               maxSigned,
-                                               bvudiv));
-                    }
+                    return z3::ite(e.arg(1) == zero, ones, zero);
                 }
+                else if ((!flip && goal == UNSIGN_MAX) || (flip && goal == UNSIGN_MIN))
+                {
+                    if (isFreeVariable(e.arg(0))) {
+                        appliedSubstitutions.push_back({e.arg(0), ones, false});
+                    }
+                    return z3::ite(e.arg(1) == zero, ones, bvudiv); // for a/0, the max is 11..1, for a/b it is 11...1/b
+                }
+                else if ((!flip && goal == SIGN_MIN) || (flip && goal == SIGN_MAX))
+                {
+                    auto minSigned = z3::concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)); //1000...0
+                    if (isFreeVariable(e.arg(0))) {
+                        expr subst = z3::ite(e.arg(1) == one,
+                                             minSigned,
+                                             zero);
+                        appliedSubstitutions.push_back({e.arg(0), subst, false});
+                    }
+                    return z3::ite(e.arg(1) == zero,
+                                   ones,
+                                   z3::ite(e.arg(1) == one,
+                                           minSigned,
+                                           zero));
+                }
+                else if ((!flip && goal == SIGN_MAX) || (flip && goal == SIGN_MIN))
+                {
+                    auto maxSigned = concat(context->bv_val(0, 1), context->bv_val(-1, bvSize - 1));
+                    if (isFreeVariable(e.arg(0))) {
+                        expr subst = z3::ite(e.arg(1) == one,
+                                             maxSigned,
+                                             ones);
+                        appliedSubstitutions.push_back({e.arg(0), subst, false});
+                    }
+                    return z3::ite(e.arg(1) == zero,
+                                   ones,
+                                   z3::ite(e.arg(1) == one,
+                                           maxSigned,
+                                           bvudiv));
+                }
+            }
 
-		// bvurem may return all values from {0,...,(2^32-1)/t}
-		// (bvurem u t) -> (ite (= t 0) (11...1) (ite (bvule u (bvudiv (11...1)/t)) u 0))
-		return ite(e.arg(1) == zero,
-		 	   ones,
-		 	   ite(bvule, e.arg(0), zero));
+            // bvurem may return all values from {0,...,(2^32-1)/t}
+            // (bvurem u t) -> (ite (= t 0) (11...1) (ite (bvule u (bvudiv (11...1)/t)) u 0))
+
+            if(isFreeVariable(e.arg(0))) {
+                appliedSubstitutions.push_back({e.arg(0), ite(bvule, e.arg(1) * e.arg(0), zero), false});
+            }
+            return ite(e.arg(1) == zero,
+                   ones,
+                   ite(bvule, e.arg(0), zero));
 	    }
 	}
 	else if (decl_kind == Z3_OP_OR)
@@ -761,29 +1051,33 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
 
 	    for (unsigned int i = 0; i < num; i++)
 	    {
-		if (isUnconstrained(e.arg(i), boundVars))
-		{
-		    auto boundType = getBoundType(e.arg(i), boundVars);
-		    if ((boundType == EXISTENTIAL && isPositive) || (boundType == UNIVERSAL && !isPositive))
-		    {
-			return context->bool_val(true);
-		    }
-
-		    changed = true;
-		}
-		else
-		{
-		    toReturnVec.push_back(e.arg(i));
-		}
+            if (isUnconstrained(e.arg(i), boundVars))
+            {
+                auto boundType = getBoundType(e.arg(i), boundVars);
+                if ((boundType == EXISTENTIAL && isPositive) || (boundType == UNIVERSAL && !isPositive))
+                {
+                    if (isFreeVariable(e.arg(i))) {
+                        appliedSubstitutions.push_back({e.arg(0), context->bool_val(true), false});
+                    }
+                    return context->bool_val(true);
+                }
+                if (isFreeVariable(e.arg(i))) {
+                    appliedSubstitutions.push_back({e.arg(0), context->bool_val(false), false});
+                }
+                changed = true;
+            }
+            else
+            {
+                toReturnVec.push_back(e.arg(i));
+            }
 	    }
 
 	    if (changed)
 	    {
-		for (auto const &toReturnPart : toReturnVec)
-		{
-		    toReturn = toReturn || toReturnPart;
-		}
-
+            for (auto const &toReturnPart : toReturnVec)
+            {
+                toReturn = toReturn || toReturnPart;
+            }
 		return toReturn;
 	    }
 	}
@@ -796,30 +1090,35 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
 
 	    for (unsigned int i = 0; i < num; i++)
 	    {
-		if (isUnconstrained(e.arg(i), boundVars))
-		{
-		    auto boundType = getBoundType(e.arg(i), boundVars);
-		    if ((boundType == EXISTENTIAL && !isPositive) || (boundType == UNIVERSAL && isPositive))
-		    {
-			return context->bool_val(false);
-		    }
-
-		    changed = true;
-		}
-		else
-		{
-		    toReturnVec.push_back(e.arg(i));
-		}
+            if (isUnconstrained(e.arg(i), boundVars))
+            {
+                auto boundType = getBoundType(e.arg(i), boundVars);
+                if ((boundType == EXISTENTIAL && !isPositive) || (boundType == UNIVERSAL && isPositive))
+                {
+                    if (isFreeVariable(e.arg(i))) {
+                        appliedSubstitutions.push_back({e.arg(0), context->bool_val(false), false});
+                    }
+                    return context->bool_val(false);
+                }
+                if (isFreeVariable(e.arg(i))){
+                    appliedSubstitutions.push_back({e.arg(0), context->bool_val(true), false});
+                }
+                changed = true;
+            }
+            else
+            {
+                toReturnVec.push_back(e.arg(i));
+            }
 	    }
 
 	    if (changed)
 	    {
-		for (auto const &toReturnPart : toReturnVec)
-		{
-		    toReturn = toReturn && toReturnPart;
-		}
+            for (auto const &toReturnPart : toReturnVec)
+            {
+                toReturn = toReturn && toReturnPart;
+            }
 
-		return toReturn;
+            return toReturn;
 	    }
 	}
 	else if (decl_kind == Z3_OP_IFF)
@@ -828,109 +1127,150 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
 //			return ((simplifyOnce(e.arg(0), boundVars, isPositive) || !simplifyOnce(e.arg(1), boundVars, !isPositive)) &&
 //					(!simplifyOnce(e.arg(0), boundVars, !isPositive) || simplifyOnce(e.arg(1), boundVars, isPositive)));
 	}
-	else if (decl_kind == Z3_OP_NOT)
+    else if (decl_kind == Z3_OP_NOT)
 	{
 	    if (isUnconstrained(e.arg(0), boundVars))
 	    {
-		return e.arg(0);
+            if (isFreeVariable(e.arg(0)))
+                appliedSubstitutions.push_back({e.arg(0), e, false});
+		    return e.arg(0);
 	    }
 	}
-	else if (decl_kind == Z3_OP_EQ)
-	{
-	    if (isUnconstrained(e.arg(0), boundVars) && isBefore(e.arg(1), e.arg(0), boundVars, isPositive))
-	    {
-		auto boundType = getBoundType(e.arg(0), boundVars);
-		if (boundType == EXISTENTIAL)
-		{
-		    return isPositive ? context->bool_val(true) : context->bool_val(false);
-		}
-		else
-		{
-		    return isPositive ? context->bool_val(false) : context->bool_val(true);
-		}
-	    }
-	    else if (isUnconstrained(e.arg(1), boundVars) && isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
-	    {
-		auto boundType = getBoundType(e.arg(1), boundVars);
+	else if (decl_kind == Z3_OP_EQ) {
+        if (isUnconstrained(e.arg(0), boundVars) && isBefore(e.arg(1), e.arg(0), boundVars, isPositive)) {
+            auto boundType = getBoundType(e.arg(0), boundVars);
 
-		if (boundType == EXISTENTIAL)
-		{
-		    return isPositive ? context->bool_val(true) : context->bool_val(false);
-		}
-		else
-		{
-		    return isPositive ? context->bool_val(false) : context->bool_val(true);
-		}
-	    }
-	    else
-	    {
-		if (e.arg(0).is_bool())
-		{
-		    return e; //or split into implications
-		}
-		else
-		{
-		    return simplifyOnce(e.arg(0), boundVars, isPositive) == simplifyOnce(e.arg(1), boundVars, isPositive);
-		}
-	    }
-	}
+            if (boundType == EXISTENTIAL) {
+                if (isFreeVariable(e.arg(0))) {
+                    if (isPositive) {
+                        appliedSubstitutions.push_back({e.arg(0), e.arg(1), false});
+                    } else {
+                        expr subst = e;
+                        if (e.arg(1).is_bool())
+                            subst = !e.arg(1);
+                        else {
+                            int bvSize = e.arg(1).get_sort().bv_size();
+                            expr one = context->bv_val(1, bvSize);
+                            subst = to_expr(*context, Z3_mk_bvadd(*context, e.arg(1), one));
+                        }
+                        appliedSubstitutions.push_back({e.arg(0), subst, false});
+                    }
+                }
+                return isPositive ? context->bool_val(true) : context->bool_val(false);
+            } else {
+                return isPositive ? context->bool_val(false) : context->bool_val(true);
+            }
+        } else if (isUnconstrained(e.arg(1), boundVars) && isBefore(e.arg(0), e.arg(1), boundVars, isPositive)) {
+            auto boundType = getBoundType(e.arg(1), boundVars);
+
+            if (boundType == EXISTENTIAL) {
+                if (isFreeVariable(e.arg(1))) {
+                    if (isPositive) {
+                        appliedSubstitutions.push_back({e.arg(1), e.arg(0), false});
+                    } else {
+                        expr subst = e;
+                        if (e.arg(0).is_bool())
+                            subst = !e.arg(0);
+                        else {
+                            int bvSize = e.arg(1).get_sort().bv_size();
+                            expr one = context->bv_val(1, bvSize);
+                            subst = to_expr(*context, Z3_mk_bvadd(*context, e.arg(0), one));
+                        }
+                        appliedSubstitutions.push_back({e.arg(1), subst, false});
+                    }
+                }
+                return isPositive ? context->bool_val(true) : context->bool_val(false);
+            } else {
+                return isPositive ? context->bool_val(false) : context->bool_val(true);
+            }
+        } else {
+            if (e.arg(0).is_bool()) {
+                return e; //or split into implications
+            } else {
+                return simplifyOnce(e.arg(0), boundVars, isPositive) == simplifyOnce(e.arg(1), boundVars, isPositive);
+            }
+        }
+    }
 	else if (decl_kind == Z3_OP_SLEQ || decl_kind == Z3_OP_ULEQ )
 	{
+        auto bvSize = e.arg(1).get_sort().bv_size();
+        auto maxValue = decl_kind == Z3_OP_SLEQ ?
+                        concat(context->bv_val(0, 1), context->bv_val(-1, bvSize - 1)) :
+                        context->bv_val(-1, bvSize);
+        auto minValue = decl_kind == Z3_OP_SLEQ ?
+                        concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)) :
+                        context->bv_val(0, bvSize);
+
 	    if (isUnconstrained(e.arg(0), boundVars) && isBefore(e.arg(1), e.arg(0), boundVars, isPositive))
 	    {
-		auto boundType = getBoundType(e.arg(0), boundVars);
-		auto bvSize = e.arg(1).get_sort().bv_size();
+            auto boundType = getBoundType(e.arg(0), boundVars);
 
-		auto maxValue = decl_kind == Z3_OP_SLEQ ?
-		    concat(context->bv_val(0, 1), context->bv_val(-1, bvSize - 1)) :
-		    context->bv_val(-1, bvSize);
-
-		if (boundType == EXISTENTIAL)
-		{
-		    return isPositive ? context->bool_val(true) : e.arg(1) == maxValue;
-		}
-		else
-		{
-		    return isPositive ? e.arg(1) == maxValue : context->bool_val(true);
-		}
+            if (boundType == EXISTENTIAL)
+            {
+                if (isFreeVariable(e.arg(0))) {
+                    if (isPositive) {
+                        appliedSubstitutions.push_back({e.arg(0), minValue, false});
+                    } else {
+                        appliedSubstitutions.push_back({e.arg(0), maxValue, false});
+                    }
+                }
+                return isPositive ? context->bool_val(true) : e.arg(1) == maxValue;
+            }
+            else
+            {
+                return isPositive ? e.arg(1) == maxValue : context->bool_val(true);
+            }
 	    }
 	    else if (isUnconstrained(e.arg(1), boundVars) && isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
 	    {
-		auto boundType = getBoundType(e.arg(1), boundVars);
-		auto bvSize = e.arg(1).get_sort().bv_size();
+            auto boundType = getBoundType(e.arg(1), boundVars);
 
-		auto minValue = decl_kind == Z3_OP_SLEQ ?
-		    concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)) :
-		    context->bv_val(0, bvSize);
-
-		if (boundType == EXISTENTIAL)
-		{
-		    return isPositive ? context->bool_val(true) : e.arg(0) == minValue;
-		}
-		else
-		{
-		    return isPositive ? e.arg(0) == minValue : context->bool_val(true);
-		}
+            if (boundType == EXISTENTIAL)
+            {
+                if (isFreeVariable(e.arg(1))) {
+                    if (isPositive) {
+                        appliedSubstitutions.push_back({e.arg(1), maxValue, false});
+                    } else {
+                        appliedSubstitutions.push_back({e.arg(1), minValue, false});
+                    }
+                }
+                return isPositive ? context->bool_val(true) : e.arg(0) == minValue;
+            }
+            else
+            {
+                return isPositive ? e.arg(0) == minValue : context->bool_val(true);
+            }
 	    }
 
-            auto arg0 = simplifyOnce(e.arg(0), boundVars, isPositive, decl_kind == Z3_OP_SLEQ ? SIGN_MIN : UNSIGN_MIN);
-            auto arg1 = simplifyOnce(e.arg(1), boundVars, isPositive, decl_kind == Z3_OP_SLEQ ? SIGN_MAX : UNSIGN_MAX);
+        auto arg0 = simplifyOnce(e.arg(0), boundVars, isPositive, decl_kind == Z3_OP_SLEQ ? SIGN_MIN : UNSIGN_MIN);
+        auto arg1 = simplifyOnce(e.arg(1), boundVars, isPositive, decl_kind == Z3_OP_SLEQ ? SIGN_MAX : UNSIGN_MAX);
 
-            return f(arg0, arg1);
+        return f(arg0, arg1);
 	}
 	else if (decl_kind == Z3_OP_SLT || decl_kind == Z3_OP_ULT)
 	{
+        auto bvSize = e.arg(1).get_sort().bv_size();
+
+        auto minValue = decl_kind == Z3_OP_SLT ?
+                        concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)) :
+                        context->bv_val(0, bvSize);
+        auto maxValue = decl_kind == Z3_OP_SLT ?
+                        concat(context->bv_val(0, 1), context->bv_val(-1, bvSize - 1)) :
+                        context->bv_val(-1, bvSize);
+
 	    if (isUnconstrained(e.arg(0), boundVars) && isBefore(e.arg(1), e.arg(0), boundVars, isPositive))
 	    {
 		auto boundType = getBoundType(e.arg(0), boundVars);
-		auto bvSize = e.arg(1).get_sort().bv_size();
-
-		auto minValue = decl_kind == Z3_OP_SLT ?
-		    concat(context->bv_val(1, 1), context->bv_val(0, bvSize - 1)) :
-		    context->bv_val(0, bvSize);
 
 		if (boundType == EXISTENTIAL)
 		{
+            if (isFreeVariable(e.arg(0))) {
+                if (isPositive) {
+                    appliedSubstitutions.push_back({e.arg(0), minValue, false});
+                } else {
+                    appliedSubstitutions.push_back({e.arg(0), maxValue, false});
+                }
+            }
 		    return isPositive ? !(e.arg(1) == minValue) : context->bool_val(false);
 		}
 		else
@@ -940,51 +1280,58 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
 	    }
 	    else if (isUnconstrained(e.arg(1), boundVars) && isBefore(e.arg(0), e.arg(1), boundVars, isPositive))
 	    {
-		auto boundType = getBoundType(e.arg(1), boundVars);
-		auto bvSize = e.arg(1).get_sort().bv_size();
+            auto boundType = getBoundType(e.arg(1), boundVars);
 
-		auto maxValue = decl_kind == Z3_OP_SLT ?
-		    concat(context->bv_val(0, 1), context->bv_val(-1, bvSize - 1)) :
-		    context->bv_val(-1, bvSize);
-
-		if (boundType == EXISTENTIAL)
-		{
-		    return isPositive ? !(e.arg(0) == maxValue) : context->bool_val(false);
-		}
-		else
-		{
-		    return isPositive ? context->bool_val(false) : !(e.arg(0) == maxValue);
-		}
+            if (boundType == EXISTENTIAL)
+            {
+                if (isFreeVariable(e.arg(1))) {
+                    if (isPositive) {
+                        appliedSubstitutions.push_back({e.arg(1), maxValue, false});
+                    } else {
+                        appliedSubstitutions.push_back({e.arg(1), minValue, false});
+                    }
+                }
+                return isPositive ? !(e.arg(0) == maxValue) : context->bool_val(false);
+            }
+            else
+            {
+                return isPositive ? context->bool_val(false) : !(e.arg(0) == maxValue);
+            }
 	    }
 
-            auto arg0 = simplifyOnce(e.arg(0), boundVars, isPositive, decl_kind == Z3_OP_SLT ? SIGN_MIN : UNSIGN_MIN);
-            auto arg1 = simplifyOnce(e.arg(1), boundVars, isPositive, decl_kind == Z3_OP_SLT ? SIGN_MAX : UNSIGN_MAX);
+        auto arg0 = simplifyOnce(e.arg(0), boundVars, isPositive, decl_kind == Z3_OP_SLT ? SIGN_MIN : UNSIGN_MIN);
+        auto arg1 = simplifyOnce(e.arg(1), boundVars, isPositive, decl_kind == Z3_OP_SLT ? SIGN_MAX : UNSIGN_MAX);
 
-            return f(arg0, arg1);
+        return f(arg0, arg1);
 	}
 	else if (decl_kind == Z3_OP_ITE)
 	{
-            if (isUnconstrained(e.arg(0), boundVars) && isUnconstrained(e.arg(1), boundVars) && getBoundType(e.arg(0), boundVars) == getBoundType(e.arg(1), boundVars))
-            {
-                return e.arg(1);
-            }
+        if (isUnconstrained(e.arg(0), boundVars) && isUnconstrained(e.arg(1), boundVars) && getBoundType(e.arg(0), boundVars) == getBoundType(e.arg(1), boundVars))
+        {
+            if (isFreeVariable(e.arg(0)))
+                appliedSubstitutions.push_back({e.arg(0), context->bool_val(true), false});
+            return e.arg(1);
+        }
 
-            if (isUnconstrained(e.arg(0), boundVars) && isUnconstrained(e.arg(2), boundVars) && getBoundType(e.arg(0), boundVars) == getBoundType(e.arg(2), boundVars))
-            {
-                return e.arg(2);
-            }
+        if (isUnconstrained(e.arg(0), boundVars) && isUnconstrained(e.arg(2), boundVars) && getBoundType(e.arg(0), boundVars) == getBoundType(e.arg(2), boundVars))
+        {
+            if (isFreeVariable(e.arg(0)))
+                appliedSubstitutions.push_back({e.arg(0), context->bool_val(true), false});
+            return e.arg(2);
+        }
 
 	    auto result = ite(e.arg(0), simplifyOnce(e.arg(1), boundVars, isPositive), simplifyOnce(e.arg(2), boundVars, isPositive));
 	    if (isPositive)
 	    {
-		trueSimplificationCache.insert({e, {result, boundVars}});
+		    trueSimplificationCache.insert({e, {result, boundVars}});
 	    }
 	    else
 	    {
-		falseSimplificationCache.insert({e, {result, boundVars}});
+		    falseSimplificationCache.insert({e, {result, boundVars}});
 	    }
 	    return result;
 	}
+
 
 	expr_vector arguments(*context);
 	for (unsigned int i = 0; i < num; i++)
@@ -1084,6 +1431,58 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
 	falseSimplificationCache.insert({e, {e, boundVars}});
     }
     return e;
+}
+
+void UnconstrainedVariableSimplifier::ReconstructModel(Model &model)
+{
+    for (auto it = appliedSubstitutions.rbegin(); it != appliedSubstitutions.rend(); it++) {
+        const auto &[var, subst, isMul] = *it;
+
+        std::stringstream variableString;
+        variableString << var;
+
+        //prejmenovat pejska
+        expr pes = substituteModel(subst, model);
+
+        // dopočítání modelů pro proměnné které je ještě nemají
+        auto kolasice = countFormulaVarOccurences(pes);
+        int bvSize = subst.get_sort().bv_size();
+        expr zero = context->bv_val(0, bvSize);
+
+        for (auto iterator = kolasice.rbegin(); iterator != kolasice.rend(); iterator++) {
+            const auto &[mys, m] = *iterator;
+            std::stringstream potkan;
+            potkan << mys;
+            if (subst.is_bool()) {
+                model[potkan.str()] = vectorFromNumeral(context->bool_val(true));
+            }
+            else {
+                model[potkan.str()] = vectorFromNumeral(zero);
+            }
+        }
+
+        if (var.is_app() && var.decl().decl_kind() == Z3_OP_EXTRACT){
+            std::stringstream klokan;
+            klokan << var.arg(0);
+            auto repa = subst.get_numeral_int();
+
+            Z3_func_decl z3decl = (Z3_func_decl)var.decl();
+            int bitFrom = Z3_get_decl_int_parameter(*context, z3decl, 1);
+            repa = repa << bitFrom;
+
+            int bvSize = var.arg(0).get_sort().bv_size();
+            model[klokan.str()] = vectorFromNumeral(context->bv_val(repa, bvSize));
+            continue;
+        }
+
+        expr haf = subst;
+
+        if (isMul){
+            ReconstructModelForMul(model);
+        }
+        model[variableString.str()] = vectorFromNumeral(substituteModel(haf, model));
+    }
+
 }
 
 bool UnconstrainedVariableSimplifier::isUnconstrained(expr e, const vector<BoundVar> &boundVars) const
@@ -1246,6 +1645,12 @@ bool UnconstrainedVariableSimplifier::isBefore(expr a, expr b, const std::vector
     return (aLevel <= bLevel);
 }
 
+bool UnconstrainedVariableSimplifier::isFreeVariable(expr e)
+{
+    return (e.is_app() && e.num_args() == 0 && e.decl().name() != NULL) || (e.is_app() && e.decl().decl_kind() == Z3_OP_EXTRACT &&
+            isFreeVariable(e.arg(0)));
+}
+
 BoundType UnconstrainedVariableSimplifier::getBoundType(expr e, const std::vector<BoundVar> &boundVars)
 {
     if (e.is_var())
@@ -1257,6 +1662,7 @@ BoundType UnconstrainedVariableSimplifier::getBoundType(expr e, const std::vecto
     else if (e.is_app())
     {
 	func_decl f = e.decl();
+
 	unsigned num = e.num_args();
 
 	if (f.decl_kind() == Z3_OP_EXTRACT)
@@ -1378,7 +1784,6 @@ void UnconstrainedVariableSimplifier::maxCounts(std::map<std::string, int>&& fro
     }
 }
 
-
 std::map<std::string, int> UnconstrainedVariableSimplifier::countFormulaVarOccurences(z3::expr e)
 {
     if (e.is_app() && e.decl().decl_kind() == Z3_OP_OR)
@@ -1393,4 +1798,44 @@ std::map<std::string, int> UnconstrainedVariableSimplifier::countFormulaVarOccur
     }
 
     return countVariableOccurences(e, true);
+}
+
+void UnconstrainedVariableSimplifier::ReconstructModelForMul(Model &model) {
+    int bvSize = subst.get_sort().bv_size();
+    expr zero = context->bv_val(0, bvSize);
+    expr kocka = substituteModel(subst, model);
+    int numOfZeros = 0;
+    auto zelva = get<vector<bool>>(vectorFromNumeral(kocka));
+    for (auto iter = zelva.rbegin(); iter != zelva.rend(); iter++) {
+        auto fabia = *iter;
+        if (fabia == 0){
+            numOfZeros++;
+        }
+        else {
+            break;
+        }
+    }
+
+    int mrkev = kocka.get_numeral_int();
+    int vlk = mrkev >> numOfZeros;
+
+    //BV/20170501-Heizmann-UltimateAutomizer/MultCommutative_true-unreach-call_true-no-overflow_true-termination.c_3226.smt2
+    /*   mpz_t a;
+       mpz_set_si(a, 0);
+       mpz_t b;
+       mpz_set_si(b, vlk);
+       mpz_t c;
+       mpz_set_si(c, 1<<bvSize);
+
+       int medved = mpz_invert(a,b,c);
+*/
+    //cout<<a;
+
+    int koza = mod_inverse(vlk, 1<<bvSize);
+    auto mlz = context->bv_val(numOfZeros, bvSize);
+    auto plz = context->bv_val(koza, bvSize);
+    haf = to_expr(*context, Z3_mk_bvmul(*context, Z3_mk_bvlshr(*context, var, mlz),plz));
+
+
+    int zeli = subst.get_numeral_int();
 }
