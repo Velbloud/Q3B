@@ -23,6 +23,6 @@ struct Config
     bool flipUniversalQuantifier = false;
     bool propagateNecessaryBits = true;
 
-    bool produceModels = false;
+    bool produceModels = true;
     bool validatingSolver = false;
 };

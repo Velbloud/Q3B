@@ -21,7 +21,6 @@ expr ExprSimplifier::Simplify(expr expression)
 	std::cout << std::endl << std::endl << "input:" << std::endl;
 	std::cout << expression << std::endl;
     }
-
     expression = expression.simplify();
     expression = CanonizeBoundVariables(expression);
     expression = StripToplevelExistentials(expression);
@@ -56,7 +55,6 @@ expr ExprSimplifier::Simplify(expr expression)
 	}
 
 	clearCaches();
-
 	expression = RefinedPushQuantifierIrrelevantSubformulas(expression);
 	expression = applyDer(expression);
 
@@ -68,7 +66,7 @@ expr ExprSimplifier::Simplify(expr expression)
 
         expression = ReduceDivRem(expression);
 
-	if (propagateUnconstrained && !produceModels)
+	if (propagateUnconstrained)
 	{
 	    expression = expression.simplify();
 
