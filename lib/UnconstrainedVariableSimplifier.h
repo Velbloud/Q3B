@@ -192,8 +192,8 @@ private:
 
     std::vector<std::tuple<z3::expr, z3::expr, bool>> appliedSubstitutions;
     bool isFreeVariable(z3::expr e);
-    void ReconstructModelForMul(Model &model);
-
+    z3::expr ReconstructModelForMul(Model &model, z3::expr, z3::expr);
+    void nullVarsWithoutModel(Model &model, z3::expr);
 };
 
 #endif // UNCONSTRAINEDVARIABLESIMPLIFIER_H

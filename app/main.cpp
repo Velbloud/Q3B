@@ -36,6 +36,7 @@ void print_usage()
     std::cout << "  --simpl:add-congruences     add congruences for expensive operations [1]" << std::endl;
     std::cout << "  --simpl:unconstrained       use unconstrained variable simplification [1]" << std::endl;
     std::cout << "  --uc:goal                   take goals of unconstrained variables into account [1]" << std::endl;
+    std::cout << "  --produce-models            produce models [1]" << std::endl;
     std::cout << "  --bdd:reorder               BDD reorder type (none|win2|win2ite|win3|win3ite|sift|siftite) [sift]" << std::endl;
     std::cout << "  --simpl:flip-universal      negate universal formulas [0]" << std::endl;
     std::cout << "  --verbosity                 set level of debugging outputs [0]" << std::endl;
@@ -52,6 +53,7 @@ int main(int argc, char* argv[])
         {"simpl:unconstrained", required_argument, 0, 'p' },
         {"simpl:add-congruences", required_argument, 0, 'C' },
         {"uc:goal", required_argument, 0, 'g' },
+    {"produce-models", required_argument, 0, 'o' },
 	{"bdd:reorder", required_argument, 0, 'r' },
 	{"simpl:flip-universal", required_argument, 0, 'f' },
 	{"verbosity", required_argument, 0, 'v' },
@@ -65,7 +67,7 @@ int main(int argc, char* argv[])
 
     int opt = 0;
     int long_index = 0;
-    while ((opt = getopt_long(argc, argv,"a:m:b:p:g:r:i:c:C:f:v:hV", long_options, &long_index )) != -1) {
+    while ((opt = getopt_long(argc, argv,"a:m:b:p:g:o:r:i:c:C:f:v:hV", long_options, &long_index )) != -1) {
 	switch (opt) {
 	case 'a':
         {
@@ -92,9 +94,12 @@ int main(int argc, char* argv[])
 	case 'b':
 	    config.propagateNecessaryBits = atoi(optarg);
 	    break;
-        case 'g':
-	    config.goalUnconstrained = atoi(optarg);
-	    break;
+    case 'g':
+        config.goalUnconstrained = atoi(optarg);
+        break;
+    case 'o':
+        config.produceModels = atoi(optarg);
+        break;
 	case 'r':
 	{
 	    string optionString(optarg);

@@ -288,7 +288,7 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
                 expr e_without_unconstr_vars = context->bv_val(0, bvSize);
                 if (decl_kind == Z3_OP_BADD) {
                     if (isFreeVariable(e.arg(i))) {
-                        for (auto j = 0; j < num; j++) {
+                        for (unsigned int j = 0; j < num; j++) {
                             if (i != j) {
                                 e_without_unconstr_vars = to_expr(*context, Z3_mk_bvadd(*context, (Z3_ast) e_without_unconstr_vars, (Z3_ast)e.arg(j)));
                             }
@@ -298,7 +298,7 @@ z3::expr UnconstrainedVariableSimplifier::simplifyOnce(expr e, std::vector<Bound
                 }
                 else {
                     if (isFreeVariable(e.arg(i))) {
-                        for (int j = 0; j < num; j++) {
+                        for (unsigned int j = 0; j < num; j++) {
                             if (i != j) {
                                 e_without_unconstr_vars = to_expr(*context, Z3_mk_bvxor(*context, (Z3_ast) e_without_unconstr_vars, (Z3_ast)e.arg(j)));
                             }
@@ -1441,29 +1441,10 @@ void UnconstrainedVariableSimplifier::ReconstructModel(Model &model)
         std::stringstream variableString;
         variableString << var;
 
-        //prejmenovat pejska
-        expr pes = substituteModel(subst, model);
-
-        // dopočítání modelů pro proměnné které je ještě nemají
-        auto kolasice = countFormulaVarOccurences(pes);
-        int bvSize = subst.get_sort().bv_size();
-        expr zero = context->bv_val(0, bvSize);
-
-        for (auto iterator = kolasice.rbegin(); iterator != kolasice.rend(); iterator++) {
-            const auto &[mys, m] = *iterator;
-            std::stringstream potkan;
-            potkan << mys;
-            if (subst.is_bool()) {
-                model[potkan.str()] = vectorFromNumeral(context->bool_val(true));
-            }
-            else {
-                model[potkan.str()] = vectorFromNumeral(zero);
-            }
-        }
-
+        nullVarsWithoutModel(model, subst);
         if (var.is_app() && var.decl().decl_kind() == Z3_OP_EXTRACT){
-            std::stringstream klokan;
-            klokan << var.arg(0);
+            variableString << var.arg(0);
+            cout<<"mys"<<flush;
             auto repa = subst.get_numeral_int();
 
             Z3_func_decl z3decl = (Z3_func_decl)var.decl();
@@ -1471,16 +1452,15 @@ void UnconstrainedVariableSimplifier::ReconstructModel(Model &model)
             repa = repa << bitFrom;
 
             int bvSize = var.arg(0).get_sort().bv_size();
-            model[klokan.str()] = vectorFromNumeral(context->bv_val(repa, bvSize));
-            continue;
-        }
+            model[variableString.str()] = vectorFromNumeral(context->bv_val(repa, bvSize));
 
-        expr haf = subst;
-
-        if (isMul){
-            ReconstructModelForMul(model);
         }
-        model[variableString.str()] = vectorFromNumeral(substituteModel(haf, model));
+        else if (isMul){
+            model[variableString.str()] = ReconstructModelForMul(model, subst, var);
+        }
+        else {
+            model[variableString.str()] = vectorFromNumeral(substituteModel(subst, model));
+        }
     }
 
 }
@@ -1800,42 +1780,47 @@ std::map<std::string, int> UnconstrainedVariableSimplifier::countFormulaVarOccur
     return countVariableOccurences(e, true);
 }
 
-void UnconstrainedVariableSimplifier::ReconstructModelForMul(Model &model) {
+expr UnconstrainedVariableSimplifier::ReconstructModelForMul(Model &model, expr subst, expr var) {
     int bvSize = subst.get_sort().bv_size();
     expr zero = context->bv_val(0, bvSize);
-    expr kocka = substituteModel(subst, model);
-    int numOfZeros = 0;
-    auto zelva = get<vector<bool>>(vectorFromNumeral(kocka));
-    for (auto iter = zelva.rbegin(); iter != zelva.rend(); iter++) {
+    expr e = substituteModel(subst, model);
+    int numOfZeroes = 0;
+    auto bitVector = get<vector<bool>>(vectorFromNumeral(e));
+    for (auto iter = bitVector.rbegin(); iter != bitVector.rend(); iter++) {
         auto fabia = *iter;
         if (fabia == 0){
-            numOfZeros++;
+            numOfZeroes++;
         }
         else {
             break;
         }
     }
 
-    int mrkev = kocka.get_numeral_int();
-    int vlk = mrkev >> numOfZeros;
+    long int i = e.get_numeral_int64();
+    long int shifted = i >> numOfZeroes;
+    long int mod = 1L << bvSize;
+    long int inverse = mod_inverse(shifted, mod);
 
-    //BV/20170501-Heizmann-UltimateAutomizer/MultCommutative_true-unreach-call_true-no-overflow_true-termination.c_3226.smt2
-    /*   mpz_t a;
-       mpz_set_si(a, 0);
-       mpz_t b;
-       mpz_set_si(b, vlk);
-       mpz_t c;
-       mpz_set_si(c, 1<<bvSize);
+    auto zeroes = context->bv_val(numOfZeroes, bvSize);
+    auto inv = context->bv_val(inverse, bvSize);
+    return to_expr(*context, Z3_mk_bvmul(*context, Z3_mk_bvlshr(*context, var, zeroes),inv));
+}
 
-       int medved = mpz_invert(a,b,c);
-*/
-    //cout<<a;
+void UnconstrainedVariableSimplifier::nullVarsWithoutModel(Model &model, expr subst) {
+    expr e = substituteModel(subst, model);
+    auto varOccurences = countFormulaVarOccurences(e);
 
-    int koza = mod_inverse(vlk, 1<<bvSize);
-    auto mlz = context->bv_val(numOfZeros, bvSize);
-    auto plz = context->bv_val(koza, bvSize);
-    haf = to_expr(*context, Z3_mk_bvmul(*context, Z3_mk_bvlshr(*context, var, mlz),plz));
-
-
-    int zeli = subst.get_numeral_int();
+    for (auto iterator = varOccurences.rbegin(); iterator != varOccurences.rend(); iterator++) {
+        const auto &[variable, occ] = *iterator;
+        std::stringstream varStr;
+        varStr << variable;
+        if (subst.is_bool()) {
+            model[varStr.str()] = true;
+        }
+        else {
+            int bvSize = subst.get_sort().bv_size();
+            expr zero = context->bv_val(0, bvSize);
+            model[varStr.str()] = vectorFromNumeral(zero);
+        }
+    }
 }
